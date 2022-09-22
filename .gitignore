@@ -2,3 +2,4 @@ venv/
 **/migrations/
 *.csv
 .idea/
+**/__pycache__/

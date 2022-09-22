@@ -3,12 +3,15 @@ import io
 import json
 import datetime
 
-from django.db.models import F, ExpressionWrapper, DurationField, DateTimeField, Value, IntegerField
+from django.db.models import F, ExpressionWrapper, DurationField, DateTimeField, Value, IntegerField, Prefetch, \
+    OuterRef, Subquery, Func, Sum, FloatField
+from django.db.models.functions import Cast, TruncTime, TruncMinute, ExtractMinute, Coalesce
 from django.db import connection
 from django.http import HttpResponse
 from django.shortcuts import render
 
-from loader.models import Energy, Operators, Periods, Reasons
+
+from loader.models import Energy, Operators, Periods, Reasons, MakeIntervalSeconds, ToTimeStamp
 
 
 def load_file_energy():
@@ -133,24 +136,26 @@ def pure_sql():
               period.mode_end, period.label, period.reason, period.operator_name, period.kwh)
 
 
-# a = Periods.objects.raw("SELECT periods_data.id,  periods_data.endpoint_id, mode_start, mode_duration, mode_end,"
-#                         " label, operator_name, COALESCE (reason, 'нет данных') as reason, energy_data.kwh"
-#                         " FROM (SELECT loader_periods.id, loader_periods.endpoint_id, mode_start, mode_duration,"
-#                         " mode_start+MAKE_INTERVAL(0, 0, 0, 0, 0, mode_duration, 0) as mode_end, label"
-#                         " FROM loader_periods) periods_data"
-#                         " LEFT JOIN loader_reasons"
-#                         " ON periods_data.endpoint_id=loader_reasons.endpoint_id"
-#                         " AND periods_data.mode_start=loader_reasons.event_time"
-#                         " LEFT JOIN loader_operators"
-#                         " ON periods_data.endpoint_id=loader_operators.endpoint_id"
-#                         " AND periods_data.mode_start>=TO_TIMESTAMP(loader_operators.login_time, 'YYYY-MM-DD HH24:MI:SS.US +TZH:TZM')"
-#                         " AND periods_data.mode_end<=TO_TIMESTAMP(loader_operators.logout_time, 'YYYY-MM-DD HH24:MI:SS.US +TZH:TZM')"
-#                         " LEFT JOIN (SELECT period_id, SUM(kwh) as kwh "
-#                         " FROM (SELECT periods_data.id as period_id, kwh "
-#                         " FROM periods_data INNER JOIN loader_energy"
-#                         " ON loader_energy.endpoint_id=periods_data.endpoint_id"
-#                         " AND periods_data.mode_start<=loader_energy.event_time "
-#                         " AND loader_energy.event_time<=periods_data.mode_end) periods_energy GROUP BY period_id) energy_data"
-#                         " ON periods_data.id=energy_data.period_id"
-#
-#                         " ORDER BY periods_data.endpoint_id DESC, mode_start asc LIMIT 1000")
+
+def orm_sql():
+    x = Reasons.objects.filter(event_time=OuterRef("mode_start"), endpoint_id=OuterRef('endpoint_id'))
+    y = Operators.objects.annotate(dt_login_time=ToTimeStamp(F('login_time')), dt_logout_time=ToTimeStamp(F('logout_time'))).filter(
+        dt_login_time__lte=OuterRef("mode_start"),
+        dt_logout_time__gte=ExpressionWrapper(OuterRef('mode_start')+MakeIntervalSeconds(OuterRef('mode_duration')), output_field=DateTimeField()),
+        endpoint_id=OuterRef('endpoint_id'))
+    t = Energy.objects.filter(endpoint_id=OuterRef('endpoint_id'),
+                             event_time__gte=OuterRef('mode_start'),
+                             event_time__lte= ExpressionWrapper(OuterRef('mode_start')+MakeIntervalSeconds(OuterRef('mode_duration')),
+                             output_field=DateTimeField()))\
+                             .values('endpoint_id')\
+                             .annotate(total_kwh=Sum('kwh')).values('total_kwh')
+
+    a= Periods.objects.annotate(reason=Coalesce(Subquery(x.values('reason')[:1]), Value("нет данных")))\
+                      .annotate(mode_end=ExpressionWrapper(F('mode_start')+MakeIntervalSeconds(F('mode_duration')),
+                                output_field=DateTimeField())) \
+                      .annotate(operator_name=Subquery(y.values('operator_name')[:1]))\
+                      .annotate(kwh=Subquery(t[:1], output_field=FloatField()))
+    # for period in a:
+    #     print(period.id, period.reason, period.mode_start, period.mode_duration,
+    #           period.mode_end, period.operator_name, period.kwh)
+    print(a.query)
